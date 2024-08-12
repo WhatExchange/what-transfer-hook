@@ -1,9 +1,7 @@
-use std::{ cell::RefMut, str::FromStr };
+use std::{ cell::RefMut };
 
 use anchor_lang::prelude::*;
 use anchor_spl::{
-    associated_token::AssociatedToken,
-    token::Token,
     token_2022::spl_token_2022::{
         extension::{
             transfer_hook::TransferHookAccount,
@@ -12,16 +10,16 @@ use anchor_spl::{
         },
         pod::PodAccount,
     },
-    token_interface::{ Mint, TokenAccount, TransferChecked, transfer_checked },
+    token_interface::{ Mint, TokenAccount },
 };
 use spl_tlv_account_resolution::{
     account::ExtraAccountMeta,
     seeds::Seed,
     state::ExtraAccountMetaList,
 };
-use spl_transfer_hook_interface::instruction::ExecuteInstruction;
+use spl_transfer_hook_interface::instruction::{ExecuteInstruction, TransferHookInstruction};
 
-declare_id!("HSADtk7EsvDyMo55QA9fnDZubM31D1LTRrnp36itpydJ");
+declare_id!("A7TKxVmarz9XkuLB22xcjyKq8sLh3AAZZ8hbxxEixWw2");
 
 #[error_code]
 pub enum TransferError {
@@ -30,31 +28,27 @@ pub enum TransferError {
 
     #[msg("Amount Too big")]
     AmountTooBig,
+
+    #[msg("Numerical Overflow Error")]
+    NumericalOverflow
 }
 
 #[program]
 pub mod what_transfer_hook {
     use super::*;
 
-    #[interface(spl_transfer_hook_interface::initialize_extra_account_meta_list)]
     pub fn initialize_extra_account_meta_list(
         ctx: Context<InitializeExtraAccountMetaList>,
-        fee: u8,
-        treasuryWallet: Pubkey
     ) -> Result<()> {
-        // set authority field on white_list account as payer address
         ctx.accounts.white_list.authority = ctx.accounts.payer.key();
         ctx.accounts.white_list.is_on = true;
-        ctx.accounts.white_list.fee = fee;
-        ctx.accounts.white_list.treasury_wallet = treasuryWallet;
 
-        // let extra_account_metas = InitializeExtraAccountMetaList::extra_account_metas()?;
+        let extra_account_metas = InitializeExtraAccountMetaList::extra_account_metas()?;
 
-        // initialize ExtraAccountMetaList account with extra accounts
-        // ExtraAccountMetaList::init::<ExecuteInstruction>(
-        //     &mut ctx.accounts.extra_account_meta_list.try_borrow_mut_data()?,
-        //     &extra_account_metas
-        // )?;
+        ExtraAccountMetaList::init::<ExecuteInstruction>(
+            &mut ctx.accounts.extra_account_meta_list.try_borrow_mut_data()?,
+            &extra_account_metas
+        )?;
         Ok(())
     }
 
@@ -66,31 +60,14 @@ pub mod what_transfer_hook {
         if ctx.accounts.white_list.is_on && !ctx.accounts.white_list.white_list.contains(&ctx.accounts.destination_token.key()) {
             panic!("Account not in white list!");
         }
-
-        if amount > 50 {
-            msg!("The amount is too big {0}", amount);
-            // return err!(TransferError::AmountTooBig);
-        }
-
+        
+        msg!("The amount is too big {0}", amount);
         msg!("Owner {0}", ctx.accounts.owner.key());
         msg!("Destination {0}", ctx.accounts.destination_token.key());
         msg!("source mint {0}", ctx.accounts.source_token.key());
 
-
-        let signer_seeds: &[&[&[u8]]] = &[&[b"delegate", &[ctx.bumps.delegate]]];
-
-        // Transfer WSOL from sender to delegate token account using delegate PDA
-        // transfer lamports amount equal to token transfer amount
-        transfer_checked(
-            CpiContext::new(ctx.accounts.token_program.to_account_info(), TransferChecked {
-                from: ctx.accounts.sender_wsol_token_account.to_account_info(),
-                mint: ctx.accounts.wsol_mint.to_account_info(),
-                to: ctx.accounts.delegate_wsol_token_account.to_account_info(),
-                authority: ctx.accounts.delegate.to_account_info(),
-            }).with_signer(signer_seeds),
-            amount,
-            ctx.accounts.wsol_mint.decimals
-        )?;
+        msg!("source mint amount {0}", ctx.accounts.source_token.amount);
+        msg!("Destination mint amount {0}", ctx.accounts.destination_token.amount);
 
         Ok(())
     }
@@ -115,6 +92,26 @@ pub mod what_transfer_hook {
         ctx.accounts.white_list.is_on = false;
         
         Ok(())
+    }
+
+    pub fn fallback<'info>(
+        program_id: &Pubkey,
+        accounts: &'info [AccountInfo<'info>],
+        data: &[u8],
+    ) -> Result<()> {
+        let instruction = TransferHookInstruction::unpack(data)?;
+
+        // match instruction discriminator to transfer hook interface execute instruction  
+        // token2022 program CPIs this instruction on token transfer
+        match instruction {
+            TransferHookInstruction::Execute { amount } => {
+                let amount_bytes = amount.to_le_bytes();
+
+                // invoke custom transfer hook instruction on our program
+                __private::__global::transfer_hook(program_id, accounts, &amount_bytes)
+            }
+            _ => return Err(ProgramError::InvalidInstructionData.into()),
+        }
     }
 }
 
@@ -178,48 +175,6 @@ impl<'info> InitializeExtraAccountMetaList<'info> {
                     false, // is_signer
                     true // is_writable
                 )?,
-                // index 6, wrapped SOL mint
-                ExtraAccountMeta::new_with_pubkey(
-                    &Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap(),
-                    false,
-                    false
-                )?,
-                // index 7, token program (for wsol token transfer)
-                ExtraAccountMeta::new_with_pubkey(&Token::id(), false, false)?,
-                // index 8, associated token program
-                ExtraAccountMeta::new_with_pubkey(&AssociatedToken::id(), false, false)?,
-                // index 9, delegate PDA
-                ExtraAccountMeta::new_with_seeds(
-                    &[
-                        Seed::Literal {
-                            bytes: b"delegate".to_vec(),
-                        },
-                    ],
-                    false, // is_signer
-                    true // is_writable
-                )?,
-                // index 10, delegate wrapped SOL token account
-                ExtraAccountMeta::new_external_pda_with_seeds(
-                    8, // associated token program index
-                    &[
-                        Seed::AccountKey { index: 9 }, // owner index (delegate PDA)
-                        Seed::AccountKey { index: 7 }, // token program index
-                        Seed::AccountKey { index: 6 }, // wsol mint index
-                    ],
-                    false, // is_signer
-                    true // is_writable
-                )?,
-                // index 11, sender wrapped SOL token account
-                ExtraAccountMeta::new_external_pda_with_seeds(
-                    8, // associated token program index
-                    &[
-                        Seed::AccountKey { index: 3 }, // owner index
-                        Seed::AccountKey { index: 7 }, // token program index
-                        Seed::AccountKey { index: 6 }, // wsol mint index
-                    ],
-                    false, // is_signer
-                    true // is_writable
-                )?,
             ]
         )
     }
@@ -243,27 +198,6 @@ pub struct TransferHook<'info> {
     pub extra_account_meta_list: UncheckedAccount<'info>,
     #[account(seeds = [b"white_list"], bump)]
     pub white_list: Account<'info, WhiteList>,
-    pub wsol_mint: InterfaceAccount<'info, Mint>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    #[account(
-        mut,
-        seeds = [b"delegate"], 
-        bump
-    )]
-    pub delegate: SystemAccount<'info>,
-    #[account(
-        mut,
-        token::mint = wsol_mint, 
-        token::authority = delegate,
-    )]
-    pub delegate_wsol_token_account: InterfaceAccount<'info, TokenAccount>,
-    #[account(
-        mut,
-        token::mint = wsol_mint, 
-        token::authority = owner,
-    )]
-    pub sender_wsol_token_account: InterfaceAccount<'info, TokenAccount>,
 }
 
 #[derive(Accounts)]
@@ -296,9 +230,6 @@ pub struct TurnOffWhitelist<'info> {
 #[account]
 pub struct WhiteList {
     pub authority: Pubkey,
-    pub initial_buyer: Pubkey,
-    pub treasury_wallet: Pubkey,
     pub is_on: bool,
-    pub fee: u8,
     pub white_list: Vec<Pubkey>,
 }
